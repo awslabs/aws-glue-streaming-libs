@@ -543,6 +543,14 @@ class GlueContext(SQLContext):
 
         java_import(self._jvm, "org.apache.spark.metrics.source.StreamingSource")
 
+        if (glue_ver == '2.0' or glue_ver == '2' or glue_ver == '3.0' or glue_ver == '3'):
+            if (checkpointLocation.startswith( 's3://' )):
+                java_import(self._jvm, "com.amazonaws.regions.RegionUtils")
+                java_import(self._jvm, "com.amazonaws.services.s3.AmazonS3")
+                self._jsc.hadoopConfiguration().set("fs.s3a.endpoint", self._jvm.RegionUtils.getRegion(
+                    self._jvm.AWSConnectionUtils.getRegion()).getServiceEndpoint(self._jvm.AmazonS3.ENDPOINT_PREFIX))
+                checkpointLocation = checkpointLocation.replace( 's3://', 's3a://', 1)
+
         run = {'value': 0}
         retry_attempt = {'value': 0}
 
