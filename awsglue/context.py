@@ -21,6 +21,7 @@ from awsglue.data_source import DataSource
 from awsglue.streaming_data_source import StreamingDataSource
 from awsglue.data_sink import DataSink
 from awsglue.dataframereader import DataFrameReader
+from awsglue.dataframewriter import DataFrameWriter
 from awsglue.dynamicframe import DynamicFrame, DynamicFrameReader, DynamicFrameWriter, DynamicFrameCollection
 from awsglue.gluetypes import DataType
 from awsglue.utils import makeOptions, callsite
@@ -46,6 +47,8 @@ def register(sc):
     java_import(sc._jvm, "com.amazonaws.services.glue.util.AWSConnectionUtils")
     java_import(sc._jvm, "com.amazonaws.services.glue.util.GluePythonUtils")
     java_import(sc._jvm, "com.amazonaws.services.glue.errors.CallSite")
+    java_import(sc._jvm, "com.amazonaws.services.glue.ml.EntityDetector")
+    java_import(sc._jvm, "com.amazonaws.services.glue.ml.EvaluateDataQuality")
     # java_import(sc._jvm, "com.amazonaws.services.glue.ml.FindMatches")
     # java_import(sc._jvm, "com.amazonaws.services.glue.ml.FindIncrementalMatches")
     # java_import(sc._jvm, "com.amazonaws.services.glue.ml.FillMissingValues")
@@ -53,6 +56,7 @@ def register(sc):
 
 class GlueContext(SQLContext):
     Spark_SQL_Formats = {"parquet", "orc"}
+    Unsupported_Compression_Types = {"lzo"}
 
     def __init__(self, sparkContext, **options):
         super(GlueContext, self).__init__(sparkContext)
@@ -61,6 +65,7 @@ class GlueContext(SQLContext):
         self.create_dynamic_frame = DynamicFrameReader(self)
         self.create_data_frame = DataFrameReader(self)
         self.write_dynamic_frame = DynamicFrameWriter(self)
+        self.write_data_frame = DataFrameWriter(self)
         self.spark_session = SparkSession(sparkContext, self._glue_scala_context.getSparkSession())
         self._glue_logger = sparkContext._jvm.GlueLogger()
 
@@ -94,7 +99,11 @@ class GlueContext(SQLContext):
         >>> myFrame = data_source.getFrame()
         """
         options["callSite"] = callsite()
-        if(format and format.lower() in self.Spark_SQL_Formats):
+        compressionType = options.get("compressionType", "")
+        if compressionType in self.Unsupported_Compression_Types and format == None:
+            raise Exception("When using compressionType {}, the format parameter must be specified.".format(compressionType))
+        #if get unsupported compression type, fallback to use spark sql datasource.
+        if((format and format.lower() in self.Spark_SQL_Formats) or (compressionType in self.Unsupported_Compression_Types)):
             connection_type = format
 
         j_source = self._ssql_ctx.getSource(connection_type,
@@ -227,10 +236,55 @@ class GlueContext(SQLContext):
         """
         source = self.getSource(connection_type, format, transformation_ctx, push_down_predicate, **connection_options)
 
-        if (format and format not in self.Spark_SQL_Formats):
+        if (format and format not in self.Spark_SQL_Formats and connection_options.get("compressionType", "") not in self.Unsupported_Compression_Types):
             source.setFormat(format, **format_options)
 
         return source.getFrame(**kwargs)
+
+    def create_sample_dynamic_frame_from_catalog(self, database = None, table_name = None, num = None, sample_options = {}, redshift_tmp_dir = "",
+                                                 transformation_ctx = "", push_down_predicate="", additional_options = {},
+                                                 catalog_id = None, erieTxId = "", asOfTime = "", **kwargs):
+        """
+        return a list of sample dynamic records with catalog database, table name and an optional catalog id
+        :param database: database in catalog
+        :param table_name: table name
+        :param num: number of sample records
+        :param sample_options: options for sampling behavior
+        :param transformation_ctx: transformation context
+        :param push_down_predicate
+        :param additional_options
+        :param catalog_id catalog id of the DataCatalog being accessed (account id of the data catalog).
+                Set to None by default (None defaults to the catalog id of the calling account in the service)
+        :return: dynamic frame with potential errors
+        """
+        if database is not None and "name_space" in kwargs:
+            raise Exception("Parameter name_space and database are both specified, choose one.")
+        elif database is None and "name_space" not in kwargs:
+            raise Exception("Parameter name_space or database is missing.")
+        elif "name_space" in kwargs:
+            db = kwargs.pop("name_space")
+        else:
+            db = database
+
+        if table_name is None:
+            raise Exception("Parameter table_name is missing.")
+        source = DataSource(self._ssql_ctx.getCatalogSource(db, table_name, redshift_tmp_dir, transformation_ctx,
+                                                            push_down_predicate,
+                                                            makeOptions(self._sc, additional_options), catalog_id),
+                            self, table_name)
+        return source.getSampleFrame(num, **sample_options)
+
+    def create_sample_dynamic_frame_from_options(self, connection_type, connection_options={}, num = None, sample_options = {},
+                                                 format=None, format_options={}, transformation_ctx = "", push_down_predicate= "", **kwargs):
+        """Creates a list of sample dynamic records with the specified connection and format.
+        """
+        source = self.getSource(connection_type, format, transformation_ctx, push_down_predicate, **connection_options)
+
+        if (format and format not in self.Spark_SQL_Formats):
+            source.setFormat(format, **format_options)
+
+        return source.getSampleFrame(num, **sample_options)
+
 
     def create_data_frame_from_options(self, connection_type, connection_options={},
                                        format=None, format_options={}, transformation_ctx = "", push_down_predicate= "",  **kwargs):
@@ -336,6 +390,24 @@ class GlueContext(SQLContext):
         j_sink = self._ssql_ctx.getCatalogSink(db, table_name, redshift_tmp_dir, transformation_ctx,
                                                makeOptions(self._sc, additional_options), catalog_id)
         return DataSink(j_sink, self).write(frame)
+
+    def write_data_frame_from_catalog(self, frame, database = None, table_name = None, redshift_tmp_dir = "",
+                                      transformation_ctx = "", additional_options = {}, catalog_id = None, **kwargs):
+        if database is not None and "name_space" in kwargs:
+            raise Exception("Parameter name_space and database are both specified, choose one.")
+        elif database is None and "name_space" not in kwargs:
+            raise Exception("Parameter name_space or database is missing.")
+        elif "name_space" in kwargs:
+            db = kwargs.pop("name_space")
+        else:
+            db = database
+
+        if table_name is None:
+            raise Exception("Parameter table_name is missing.")
+
+        j_sink = self._ssql_ctx.getCatalogSink(db, table_name, redshift_tmp_dir, transformation_ctx,
+                                               makeOptions(self._sc, additional_options), catalog_id)
+        return DataSink(j_sink, self).writeDataFrame(frame, self)
 
     def write_dynamic_frame_from_jdbc_conf(self, frame, catalog_connection, connection_options={},
                                            redshift_tmp_dir = "", transformation_ctx = "", catalog_id = None):
@@ -516,19 +588,34 @@ class GlueContext(SQLContext):
         windowSizeInMilis = convert_window_size_to_milis(windowSize)
         if windowSizeInMilis >= pollingTimeInMs:
             raise ValueError("Polling time needs to be larger than window size")
+        streamingQueryManager = self.spark_session.streams
+        streamingQueryManager.resetTerminated()
+        if streamingQueryManager.active:
+            raise ValueError("There are active streaming queries for the current SparkSession." +
+                             "Please terminate all active queries or consider restart the SparkSession")
 
         tableId = str(uuid.uuid4()).replace("-", "")
-        writer = frame.writeStream\
-            .trigger(processingTime=windowSize)\
-            .queryName(tableId)\
+        memorySinkWriter = frame.writeStream \
+            .trigger(processingTime=windowSize) \
+            .queryName(tableId) \
             .format("memory")
+        forEachBatchWriter = None
         if batch_function is not None:
-            writer = writer.foreachBatch(batch_function)
+            forEachBatchWriter = frame.writeStream \
+                .trigger(processingTime=windowSize) \
+                .foreachBatch(batch_function)
 
-        query = writer.start()
+        query = memorySinkWriter.start()
         resultDF = self.spark_session.sql("select * from " + tableId + " limit " + str(recordPollingLimit))
-        time.sleep(pollingTimeInMs / 1000)
+        forEachBatchQuery = None
+        if forEachBatchWriter is not None:
+            forEachBatchQuery = forEachBatchWriter.start()
+        streamingQueryManager.awaitAnyTermination(int(pollingTimeInMs / 1000))
+
         query.stop()
+        if forEachBatchQuery is not None:
+            forEachBatchQuery.stop()
+
         return DynamicFrame.fromDF(resultDF, self, tableId)
 
 
@@ -556,6 +643,14 @@ class GlueContext(SQLContext):
 
         def batch_function_with_persist(data_frame, batchId):
 
+            if self._jvm.GlueContext.getEmitStreamingConsumerLagMetrics() \
+                    and self._jvm.GlueContext.getNumInputStreams() == 1:
+                max_lag = calculate_consumer_lag_statistics_if_present(data_frame, batchId)
+            else:
+                max_lag = -1
+
+            enriched_data_frame = add_or_remove_record_timestamp_column_if_present(data_frame)
+
             # This condition is true when the previous batch succeeded
             if run['value'] > retry_attempt['value']:
                 run['value'] = 0
@@ -567,17 +662,66 @@ class GlueContext(SQLContext):
             # process the batch
             startTime = self.currentTimeMillis()
             if "persistDataFrame" in options and options["persistDataFrame"].lower() == "false":
-                if len(data_frame.take(1)):
-                    batch_function(data_frame, batchId)
+                if len(enriched_data_frame.take(1)):
+                    batch_function(enriched_data_frame, batchId)
             else:
                 storage_level = options.get("storageLevel", "MEMORY_AND_DISK").upper()
-                data_frame.persist(getattr(pyspark.StorageLevel, storage_level))
-                num_records = data_frame.count()
+                enriched_data_frame.persist(getattr(pyspark.StorageLevel, storage_level))
+                num_records = enriched_data_frame.count()
                 if num_records > 0:
-                    batch_function(data_frame, batchId)
-                data_frame.unpersist()
+                    batch_function(enriched_data_frame, batchId)
+                enriched_data_frame.unpersist()
                 self._jvm.StreamingSource.updateNumRecords(num_records)
             self._jvm.StreamingSource.updateBatchProcessingTimeInMs(self.currentTimeMillis() - startTime)
+
+            if max_lag is not None and max_lag >= 0:
+                self._jvm.StreamingSource.updateMaxConsumerLagInMs(max_lag)
+
+        def calculate_consumer_lag_statistics_if_present(df, batchId):
+            temporary_consumer_lag_col_name = '__consumer_lag__'
+
+            if (self._jvm.GlueContext.getRecordTimestampColAddPrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()) in df.columns:
+                colName = self._jvm.GlueContext.getRecordTimestampColAddPrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()
+            elif (self._jvm.GlueContext.getRecordTimestampColRemovePrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()) in df.columns:
+                colName = self._jvm.GlueContext.getRecordTimestampColRemovePrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()
+            else:
+                return -1
+
+            def consumerLagEvaluator(timestamp):
+                return round(time.time() * 1000) - round(timestamp.timestamp() * 1000)
+
+            consumer_lag_evaluator_udf = udf(lambda z: consumerLagEvaluator(z), LongType())
+            df_with_consumer_lag = df.withColumn(temporary_consumer_lag_col_name, consumer_lag_evaluator_udf(to_timestamp(col(colName))))
+            max_consumer_lag_array = df_with_consumer_lag.select(max(col(temporary_consumer_lag_col_name))).collect()
+
+            if max_consumer_lag_array is None or not max_consumer_lag_array or not max_consumer_lag_array[0]:
+                logging.error('Encountered null or invalid record timestamp. Unable to calculate the Max consumer Lag for micro-batchId: ' + batchId)
+                return -1
+            else:
+                try:
+                    max_consumer_lag = max_consumer_lag_array[0][0]
+                    if max_consumer_lag is None:
+                        return -1
+                    else:
+                        return max_consumer_lag
+                except Exception as e:
+                    logging.error('Error occurred while evaluating max consumer lag for micro-batchId: ' + batchId)
+                    logging.error(e)
+                    return -1
+
+        def add_or_remove_record_timestamp_column_if_present(df):
+            rename_col_if_required_df = \
+                df.withColumnRenamed((self._jvm.GlueContext.getRecordTimestampColAddPrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()),
+                                     self._jvm.GlueContext.getRecordTimestampColName()) \
+                    if (self._jvm.GlueContext.getRecordTimestampColAddPrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()) in df.columns \
+                    else df
+
+            remove_col_if_required_df = \
+                rename_col_if_required_df.drop(self._jvm.GlueContext.getRecordTimestampColRemovePrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()) \
+                    if (self._jvm.GlueContext.getRecordTimestampColRemovePrefix() + self._jvm.GlueContext.getRecordTimestampColSuffix()) in df.columns \
+                    else rename_col_if_required_df
+
+            return remove_col_if_required_df
 
         query = frame.writeStream.foreachBatch(batch_function_with_persist).trigger(processingTime=windowSize).option("checkpointLocation", checkpointLocation)
 
