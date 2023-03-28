@@ -300,7 +300,7 @@ class DynamicFrame(object):
                                              _call_site(self._sc, callsite(), info), long(stageThreshold),
                                              long(totalThreshold)),
                             self.glue_ctx, self.name)
-            
+
     def join(self, paths1, paths2, frame2, transformation_ctx = "", info = "", stageThreshold = 0, totalThreshold = 0):
         if isinstance(paths1, basestring):
             paths1 = [paths1]
@@ -387,6 +387,10 @@ class DynamicFrame(object):
             transformation_ctx,
             _call_site(self._sc, callsite(), info), long(stageThreshold), long(totalThreshold))
 
+        return DynamicFrame(new_jdf, self.glue_ctx, self.name)
+
+    def unnest_ddb_json(self, transformation_ctx="", info="", stageThreshold=0, totalThreshold=0):
+        new_jdf = self._jdf.unnestDDBJson(transformation_ctx, _call_site(self._sc, callsite(), info), long(stageThreshold), long(totalThreshold))
         return DynamicFrame(new_jdf, self.glue_ctx, self.name)
 
     def resolveChoice(self, specs=None, choice="", database=None, table_name=None,

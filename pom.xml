@@ -2,7 +2,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.amazonaws</groupId>
   <artifactId>AWSGlueStreamingETLPython</artifactId>
-  <version>3.0.0</version>
+  <version>4.0.0</version>
   <name>${project.artifactId}</name>
   <description>Python library for AWS Glue Streaming ETL libraries</description>
   <licenses>
