@@ -541,6 +541,8 @@ class GlueContext(SQLContext):
         windowSize = options["windowSize"]
         checkpointLocation = options["checkpointLocation"]
 
+        # Check the Glue version
+        glue_ver = self.getConf('spark.glue.GLUE_VERSION', '')
         java_import(self._jvm, "org.apache.spark.metrics.source.StreamingSource")
 
         if (glue_ver == '2.0' or glue_ver == '2' or glue_ver == '3.0' or glue_ver == '3'):
